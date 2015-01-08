@@ -13,7 +13,7 @@ import (
 	"time"
 	"math/rand"
 	"sync"
-	// "os"
+	"os"
 	// "reflect"
 	"fmt"
 )
@@ -21,14 +21,23 @@ import (
 
 type state int
 const (
-	FOLLOWER state = iota
-	CANDIDATE state = iota
-	LEADER state = iota
+	FOLLOWER state   = iota
+	CANDIDATE state  = iota
+	LEADER state     = iota
+	SAME_STATE state = iota // neutral value, indicates maintaining state
+	NO_STATE state   = iota // before looping on any state
 )
 
+func initRand() (seed int64)  {
+	seed = int64(time.Now().Nanosecond())
+	rand.Seed(seed)
+	return
+}
+
 var (
-	randETTime time.Duration = time.Duration(150) + time.Duration(rand.Int() % 150)
-	TERM_TIME time.Duration = time.Duration(100) * time.Second
+	seed = initRand()
+	randETTime time.Duration = time.Duration(150) + time.Duration(rand.Intn(150))
+	TERM_TIME time.Duration = time.Duration(60) * time.Second
 	ELECTION_TIMEOUT_TIME time.Duration  = randETTime * time.Millisecond
 	HEARTBEAT_TIME time.Duration = time.Duration(50) * time.Millisecond 
 )
@@ -60,140 +69,188 @@ type Server struct{
 	// rpc interface
 	rpcFunctions *RpcFunctions
 
+	leader string
+
 	peerServers []PeerServer
 	nPeerServers int 
 	nConnected int
 
 	stateChange chan state
 	restartElectionTimeout chan int
-	stopHeartBeat chan int
+	stopElectionTimeout chan int
+	stopHeartbeat chan int
 	heartbeatChan chan HeartbeatResponse
+	respChan chan VoteResponse
+	stopLoopChan []chan int
+	doneLoopChan []chan int
+	heartbeatDone chan int
 
 	bigServerLock sync.Mutex 
+	stateLock sync.Mutex
 }
 var GLOBAL_SERVER *Server
 
-type RpcFunctions struct {
-}
-
-type VoteRequest struct {
-	name string
-	term int
-}
-
-type VoteResponse struct {
-	name string
-	term int
-}
-
-type Heartbeat struct {
-	name string
-	term int
-}
-
-type HeartbeatResponse struct {
-	name string
-	term int
-}
-
-func (s *Server) newVoteRequest( name string, term int) *VoteRequest{
-	return &VoteRequest{ name : name, term : term }
-}
-
-func (s *Server) newHeartbeat( name string, term int) *Heartbeat{
-	return &Heartbeat{ name : name, term : term }
-}
-
 func (s *Server) termTicker() {
-	fmt.Println("termTicker")
-	termTicker := time.NewTicker(time.Millisecond * TERM_TIME)
+	termTicker := time.NewTicker(TERM_TIME)
 	go func() {
 		for _ = range termTicker.C {
+			s.stateLock.Lock()
+			fmt.Println("term tick")
 			s.stateChange <- CANDIDATE
+			s.stateLock.Unlock()
 		}
 	} ()
 }
 
 func (s *Server) electionTimeoutTicker() {
-	fmt.Println("electionTimeoutTicker")
-	etTicker := time.NewTicker(time.Millisecond * ELECTION_TIMEOUT_TIME)
+	ELECTION_TIMEOUT_TIME = (time.Duration(150) + time.Duration(rand.Intn(150))) * time.Millisecond
+	fmt.Println("electionTimeoutTicker, ", ELECTION_TIMEOUT_TIME)
+	etTicker := time.NewTicker(ELECTION_TIMEOUT_TIME*100)
+
 	go func() {
 		for _ = range etTicker.C {
+			s.stateLock.Lock()
+			fmt.Println("election tick")
 			s.stateChange <- CANDIDATE
+			s.stateLock.Unlock()
 		}
 	} ()
-	// todo: here if a get a heatbeat received confirmation I restart the ticker
-	<- s.restartElectionTimeout
-	etTicker.Stop()
-	s.electionTimeoutTicker()
+
+	for {
+		select{
+		case <- s.restartElectionTimeout:
+			etTicker.Stop()
+			s.electionTimeoutTicker()
+		// case <- s.stopElectionTimeout:
+			// fmt.Println("stop election timeout ticker")
+			// etTicker.Stop()
+		}
+	}
+	
 }
 
 func (s *Server) heartbeatTicker(){
+	defer func() { s.heartbeatDone<-1 } ()
 	fmt.Println("heartbeatTicker")
 	s.heartbeatChan = make( chan HeartbeatResponse)
-	hbTicker := time.NewTicker(time.Millisecond * HEARTBEAT_TIME)
+	hbTicker := time.NewTicker(HEARTBEAT_TIME)
 	go func() {
 		for _ = range hbTicker.C {
 			for _, peerServer := range s.peerServers {
-				peerServer.client.Call("Heartbeat", s.newHeartbeat(s.name, s.term), &s.heartbeatChan)
+				s.stateLock.Lock()
+				if s.state != LEADER {
+					continue
+				}
+				s.stateLock.Unlock()
+				s.bigServerLock.Lock()
+				term := s.term
+				s.bigServerLock.Unlock()
+				go peerServer.client.Call("RpcFunctions.Heartbeat", newHeartbeat(s.name, term), &s.heartbeatChan)
 			}
 		}
 	} ()
-	// todo: here if a get a heatbeat received confirmation I restart the ticker
-	<- s.stopHeartBeat
+	<- s.stopHeartbeat
+	fmt.Println("stopping heartbeatTicker")
 	hbTicker.Stop()
 	// s.heartbeatChan.Close()
 }
 
 
 func (s *Server) followerLoop(){
-	fmt.Println("	followerLoop")
+	s.restartElectionTimeout <- 1
+	defer func() {s.doneLoopChan[int(FOLLOWER)] <- 1 } ()
+	fmt.Println("	followerLoop for leader", s.leader)
+	time.Sleep(time.Second * 2)
 	for {
-
+		select{
+		case <-s.stopLoopChan[int(FOLLOWER)]:
+			return
+		}
 	}
 }
 
-
 func (s *Server) candidateLoop(){
-	fmt.Println("candidateLoop")
-	// todo: clean candidate fields
+	defer func() { s.doneLoopChan[int(CANDIDATE)] <- 1 } ()
+	s.bigServerLock.Lock()
+	s.stateLock.Lock()
 	s.term += 1
 	s.votedFor = s.name
 	s.votesReceived = 1
+	s.leader = ""
+	s.bigServerLock.Unlock()
+	s.stateLock.Unlock()
 
-	respChan := make( chan VoteResponse, len(s.peerServers))
 	var wg sync.WaitGroup
 	for _, peerServer := range s.peerServers {
 		wg.Add(1)
 		go func( peerServer PeerServer) {
 			defer wg.Done()
-			peerServer.client.Call("RequestVote", s.newVoteRequest(s.name, s.term), respChan)
+			var voteResponse VoteResponse
+			s.bigServerLock.Lock()
+			term := s.term
+			s.bigServerLock.Unlock()
+
+			err := peerServer.client.Call("RpcFunctions.RequestVote", newVoteRequest(s.name, term), &voteResponse)
+			if err != nil {
+				fmt.Println(err, peerServer.addrName)
+				os.Exit(1)
+			}
+			s.respChan <- voteResponse
 		} (peerServer)
 	}
-	s.restartElectionTimeout <- 1
+	// wg.Wait()
+	// s.bigServerLock.Unlock()
+	// s.restartElectionTimeout <- 1
 
 	for {
 		if s.votesReceived >= s.getVoteMajority() {
+			fmt.Println("LEADER")
+			
+			s.bigServerLock.Lock()
+			s.leader = s.name
+			s.bigServerLock.Unlock()
+
+			s.stateLock.Lock()
 			s.stateChange <- LEADER
+			s.stateLock.Unlock()
 			return
 		}
 
 		select {
-		case resp := <-respChan:
-			if s.isVoteResponse(resp){
-				fmt.Println("Received response from ", resp.name)
+		case resp := <-s.respChan:
+			s.bigServerLock.Lock()
+			term := s.term
+			s.bigServerLock.Unlock()
+
+			if is, stateChange := isVoteResponse(resp, term); is {
+				fmt.Println("Received response from ", resp.Name)
 				s.votesReceived += 1
+
+			} else if stateChange != SAME_STATE {
+				s.stateLock.Lock()
+				s.stateChange <- stateChange
+				s.stateLock.Unlock()
 			}
+		case <-s.stopLoopChan[int(CANDIDATE)]:
+			return
 		}
-		
 	}
 	
 }
 
 func (s *Server) leaderLoop(){
+	defer func(){ s.doneLoopChan[int(LEADER)] <- 1 } ()
 	fmt.Println("leaderLoop")
-	s.heartbeatTicker()
+	s.stopHeartbeat = make(chan int, 1)
+	s.heartbeatDone = make(chan int, 1)
+	go s.heartbeatTicker()
 	for {
+		select{
+		case <-s.stopLoopChan[int(LEADER)]:
+			s.stopHeartbeat <- 1
+			<-s.heartbeatDone
+			return
+		}
 
 	}
 }
@@ -201,24 +258,31 @@ func (s *Server) leaderLoop(){
 func (s *Server) loop() {
 	fmt.Println("	loop ")
 
-	st :=  <-s.stateChange
-	fmt.Println("	loop with state =", st)
 	for {
-		s.state = st
-		switch st {
-		case FOLLOWER:
-			s.followerLoop()
-		case CANDIDATE:
-			s.candidateLoop()
-		case LEADER:
-			s.leaderLoop()
+		select{
+		case st :=  <-s.stateChange:
+			s.stateLock.Lock()			
+			fmt.Println("change state from", s.state, " to", st)
+			if s.state != NO_STATE {
+				s.stopLoopChan[int(s.state)] <- 1
+				<-s.doneLoopChan[int(s.state)]
+			}
+			s.state = st
+			s.stateLock.Unlock()			
+			switch st {
+			case FOLLOWER:
+				go s.followerLoop()
+			case CANDIDATE:
+				go s.candidateLoop()
+			case LEADER:
+				go s.leaderLoop()
+			}
 		}
 	}
 }
 
 // start connection with each of the peer servers
 func (s *Server) contactServers( serversI []int) {
-	fmt.Println("contactServers")
 	nServers := len(serversI)
 	nextServersI := make([]int, 0)
 	for idx:=0; idx<nServers; idx++ {
@@ -257,15 +321,17 @@ func (s *Server) contactServers( serversI []int) {
 		s.contactServers(nextServersI)
 	}
 }
+
+// waiting for peer servers to complete their connection to us
 func (s *Server) waitFullContact(){
 	for {
 		s.bigServerLock.Lock()
 		if s.nConnected == s.nPeerServers{
-			fmt.Println("waitFullContact", s.nConnected, s.nPeerServers)
+			fmt.Println("waitFullContact", s.nConnected, "connected of", s.nPeerServers)
 			s.bigServerLock.Unlock()
 			break
 		} else {
-			fmt.Println("waitFullContact", s.nConnected, s.nPeerServers)
+			fmt.Println("waitFullContact", s.nConnected, "connected of", s.nPeerServers)
 			s.bigServerLock.Unlock()
 			time.Sleep( 3 * time.Second )
 		}
@@ -274,6 +340,7 @@ func (s *Server) waitFullContact(){
 
 func NewServer() (*Server, error){
 	s := &Server{}
+	GLOBAL_SERVER = s
 	config, err := s.readConfigFile()
 	if config == nil {
 		return s, err
@@ -286,8 +353,8 @@ func NewServer() (*Server, error){
 	s.name = "Server " + strconv.Itoa(port)
 	s.location = ServerLocation{addr, port}
 	s.addrName = addr + ":" + strconv.Itoa(port)
+	s.state = NO_STATE
 	s.term = 0
-	GLOBAL_SERVER = s
 	fmt.Println(s.name, "started")
 
 	s.nPeerServers = len(config.Servers)-1
@@ -308,14 +375,25 @@ func NewServer() (*Server, error){
 	s.contactServers(serversI)
 	s.waitFullContact()
 
+	s.restartElectionTimeout = make(chan int, 1)
+	s.stopElectionTimeout = make(chan int, 2)
+	s.respChan = make( chan VoteResponse, len(s.peerServers)*10)
+	s.stateChange = make(chan state, 1)
+	s.stopLoopChan = make([]chan int, 3)
+	s.stopLoopChan[int(FOLLOWER)] = make(chan int, 1)
+	s.stopLoopChan[int(CANDIDATE)] = make(chan int, 1)
+	s.stopLoopChan[int(LEADER)] = make(chan int, 1)
+	s.doneLoopChan = make([]chan int, 3)
+	s.doneLoopChan[int(FOLLOWER)] = make(chan int, 1)
+	s.doneLoopChan[int(CANDIDATE)] = make(chan int, 1)
+	s.doneLoopChan[int(LEADER)] = make(chan int, 1)
+	
+	s.stateChange<-FOLLOWER
 	go s.termTicker()
 	go s.electionTimeoutTicker()
 
-	s.stateChange = make(chan state, 1)
-	s.stateChange<-FOLLOWER
 	s.loop()
 
-	// fmt.Println("Server", s)
 	return s, nil
 }
 
@@ -354,57 +432,6 @@ func (s *Server) serve(config *Config) (string, int, error) {
 	return config.Addr, p, nil
 }
 
-func (rpcf *RpcFunctions) Heartbeat(hb *Heartbeat, c *chan HeartbeatResponse ) error{
-	fmt.Println("Received heartbeat from", hb.name)
-	hr := HeartbeatResponse{}
-	(*c) <- hr
-	return nil
-}
-
-func (rpcf *RpcFunctions) RequestVote(rv *VoteRequest, c *chan VoteResponse ) error{
-	fmt.Println("Received requestVote from", rv.name)
-	(*c) <- VoteResponse{}
-	return nil
-	
-}
-
-func (rpcf *RpcFunctions) Connect(addrName string, reply *int ) error{
-	s := GLOBAL_SERVER
-	fmt.Println(" !!!!!!!!! Connect from", addrName)
-	s.bigServerLock.Lock()
-	defer s.bigServerLock.Unlock()
-
-	for i:=0; i<s.nPeerServers; i++{
-		if s.peerServers[i].addrName == addrName {
-			if s.peerServers[i].connected == true {
-				*reply = 1
-				return errors.New("already connected to " + s.peerServers[i].addrName)
-			} else{
-				s.peerServers[i].connected = true
-				s.nConnected ++
-				*reply = 0
-				return nil
-			}
-		}
-	}
-	return nil
-	
-}
-
 func (s *Server) getVoteMajority() int{
 	return s.nPeerServers/2+1
-}
-
-func (s *Server) isVoteResponse( vr VoteResponse ) bool {
-	dif := vr.term - s.term
-	switch {
-		case dif > 0:
-			s.stateChange <- FOLLOWER
-			return false
-		case dif == 0:
-			return true
-		case dif < 0:
-			return false
-	}
-	return false
 }
